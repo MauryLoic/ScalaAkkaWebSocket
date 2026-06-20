@@ -15,9 +15,9 @@ import spray.json._
 // ---------- Client -> Server commands ----------
 sealed trait ClientCommand
 case class PlayerJoin(player_id: String, player_name: String, x: Double, y: Double,
-                      direction: String, state: String) extends ClientCommand
+                      direction: Option[String], state: Option[String]) extends ClientCommand
 case class ChatMessage(player_id: String, player_name: String, message: String) extends ClientCommand
-case class PlayerMove(player_name: String, x: String, y: String,
+case class PlayerMove(player_name: String, x: Double, y: Double,
                       direction: String, state: String) extends ClientCommand
 // Internal routing sentinel: produced by the incoming flow, diverted to the private queue.
 case class Error(error: String) extends ClientCommand
@@ -105,11 +105,13 @@ class PlayerArea extends Actor with ActorLogging with Timers {
       broadcastUserList()
 
     case Incoming(connId, PlayerJoin(playerId, name, x, y, dir, st)) =>
+      log.info("Connection")
+      log.info(s"playerId: $playerId playerName: $name ")
       if (playerId == null || playerId.trim.isEmpty) {
         // empty player_id -> targeted error to the sender only
         connections.get(connId).foreach(_.offer(ServerError("INVALID_PLAYER_ID", "player_id is required")))
       } else {
-        players = players + (connId -> Player(playerId, name, x, y, dir, st, now.toEpochMilli))
+        players = players + (connId -> Player(playerId, name, x, y, dir.getOrElse(""), st.getOrElse(""), now.toEpochMilli))
         log.info(s"players (${players.size}) : $players")
 
         // world_state -> to the new player only
@@ -126,14 +128,12 @@ class PlayerArea extends Actor with ActorLogging with Timers {
         broadcastUserList()
       }
 
-    case Incoming(connId, PlayerMove(_, xStr, yStr, dir, st)) =>
+    case Incoming(connId, PlayerMove(_, newX, newY, dir, st)) =>
       players.get(connId) match {
         case None =>
           // move sent before player_join
           connections.get(connId).foreach(_.offer(ServerError("PLAYER_NOT_JOINED", "send player_join first")))
         case Some(p) =>
-          (Try(xStr.toDouble).toOption, Try(yStr.toDouble).toOption) match {
-            case (Some(newX), Some(newY)) =>
               val distance = math.hypot(newX - p.x, newY - p.y)
               if (distance > MaxPlayerSpeed + MoveTolerance) {
                 // refused -> resync the sender to its last known server position (sender only)
@@ -147,11 +147,7 @@ class PlayerArea extends Actor with ActorLogging with Timers {
                   EntityMove(updated.playerId, updated.playerId, updated.playerName,
                     updated.x, updated.y, updated.direction, updated.state)))
               }
-            case _ =>
-              // x or y is not a number
-              connections.get(connId).foreach(_.offer(ServerError("INVALID_MOVE", "x and y must be numbers")))
           }
-      }
 
     case Incoming(connId, ChatMessage(playerId, name, message)) =>
       // update player_name + last_activity if the player already exists
@@ -160,6 +156,10 @@ class PlayerArea extends Actor with ActorLogging with Timers {
       }
       // broadcast to ALL connected clients (sender included)
       connections.values.foreach(_.offer(ChatBroadcast(playerId, name, message)))
+
+    // any other command: not handled, logged so nothing is silently dropped
+    case Incoming(connId, other) =>
+      log.info(s"Unhandled command from $connId : $other")
 
     case ConnectionClosed(connId) =>
       // remove the player + its outbound channel from both maps
@@ -172,10 +172,6 @@ class PlayerArea extends Actor with ActorLogging with Timers {
       }
       broadcastUserList()
       log.info(s"Disconnected $connId — players: ${players.size}, connections: ${connections.size}")
-
-    // any other command: not handled, logged so nothing is silently dropped
-    case Incoming(connId, other) =>
-      log.info(s"Unhandled command from $connId : $other")
   }
 }
 
@@ -237,7 +233,7 @@ object AkkaWebSocketServer extends App
       // Error sentinels are converted to ServerError and pushed to the private queue (targeted)
       .divertTo(
         Sink.foreach[ClientCommand] {
-          case Error(e) => privateRef.offer(ServerError("ERROR", e))
+          case Error(code) => privateRef.offer(ServerError(code, s"rejected: $code"))
           case _        => ()
         },
         { case _: Error => true; case _ => false }
