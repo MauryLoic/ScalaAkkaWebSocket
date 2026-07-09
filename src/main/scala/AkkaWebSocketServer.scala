@@ -1,7 +1,7 @@
 import akka.NotUsed
 import akka.actor.{Actor, ActorLogging, ActorSystem, Props, Timers}
 import akka.http.scaladsl.Http
-import akka.http.scaladsl.model.ws.{Message, TextMessage}
+import akka.http.scaladsl.model.ws.{BinaryMessage, Message, TextMessage}
 import akka.http.scaladsl.server.Directives._
 import akka.stream.{BoundedSourceQueue, OverflowStrategy}
 import akka.stream.scaladsl.{Flow, Sink, Source}
@@ -134,20 +134,20 @@ class PlayerArea extends Actor with ActorLogging with Timers {
           // move sent before player_join
           connections.get(connId).foreach(_.offer(ServerError("PLAYER_NOT_JOINED", "send player_join first")))
         case Some(p) =>
-              val distance = math.hypot(newX - p.x, newY - p.y)
-              if (distance > MaxPlayerSpeed + MoveTolerance) {
-                // refused -> resync the sender to its last known server position (sender only)
-                connections.get(connId).foreach(_.offer(
-                  EntityMove(p.playerId, p.playerId, p.playerName, p.x, p.y, p.direction, p.state)))
-              } else {
-                // accepted -> update state and broadcast to everyone
-                val updated = p.copy(x = newX, y = newY, direction = dir, state = st, lastActivity = now.toEpochMilli)
-                players = players + (connId -> updated)
-                connections.values.foreach(_.offer(
-                  EntityMove(updated.playerId, updated.playerId, updated.playerName,
-                    updated.x, updated.y, updated.direction, updated.state)))
-              }
+          val distance = math.hypot(newX - p.x, newY - p.y)
+          if (distance > MaxPlayerSpeed + MoveTolerance) {
+            // refused -> resync the sender to its last known server position (sender only)
+            connections.get(connId).foreach(_.offer(
+              EntityMove(p.playerId, p.playerId, p.playerName, p.x, p.y, p.direction, p.state)))
+          } else {
+            // accepted -> update state and broadcast to everyone
+            val updated = p.copy(x = newX, y = newY, direction = dir, state = st, lastActivity = now.toEpochMilli)
+            players = players + (connId -> updated)
+            connections.values.foreach(_.offer(
+              EntityMove(updated.playerId, updated.playerId, updated.playerName,
+                updated.x, updated.y, updated.direction, updated.state)))
           }
+      }
 
     case Incoming(connId, ChatMessage(playerId, name, message)) =>
       // update player_name + last_activity if the player already exists
@@ -157,7 +157,7 @@ class PlayerArea extends Actor with ActorLogging with Timers {
       // broadcast to ALL connected clients (sender included)
       connections.values.foreach(_.offer(ChatBroadcast(playerId, name, message)))
 
-    // any other command: not handled, logged so nothing is silently dropped
+      // any other command: not handled, logged so nothing is silently dropped
     case Incoming(connId, other) =>
       log.info(s"Unhandled command from $connId : $other")
 
@@ -212,9 +212,12 @@ object AkkaWebSocketServer extends App
 
     // ----- incoming : parse JSON -> typed command -> actor -----
     val incoming = Flow[Message]
-      .collect { case tm: TextMessage.Strict => tm.text }
+      .mapAsync(1) {
+        case tm: TextMessage   => tm.toStrict(3.seconds).map(_.text)
+        case bm: BinaryMessage => bm.toStrict(3.seconds).map(_ => "") // drain + ignore binary
+      }
+      .filter(_.nonEmpty)
       .map { text =>
-        println(s"Received: $text")
         Try(text.parseJson.convertTo[ProtocolMessage])
       }
       .map(_.toEither)
